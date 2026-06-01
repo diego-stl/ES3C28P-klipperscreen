@@ -101,5 +101,17 @@ La pantalla está basada en el microcontrolador **ESP32-S3** con un panel LCD IP
   * **Protector de Pantalla (Screen Sleep/Wake):** Implementamos un selector dropdown en configuración con opciones de temporizador de inactividad (`Nunca`, `1 min`, `5 min` por defecto). Si no se detecta actividad táctil capacitiva durante dicho período, el microcontrolador suspende el PWM al **0%** apantallando a negro el display para ahorrar energía y proteger el panel.
   * **Intercepción Táctil Inteligente:** Al tocar el panel apagado, este se reactiva instantáneamente a su brillo anterior e **ignora/consume el primer toque**, previniendo de forma segura clics involuntarios sobre la interfaz subyacente.
 
+### Fase 11: Control del LED de Estado RGB Integrado y Parpadeo Inteligente
+* **Objetivo:** Configurar y controlar el LED RGB direccionable incorporado en la parte inferior de la pantalla ES3C28P (GPIO 42), vinculándolo a la telemetría en vivo de Klipper y diseñando una sección de pruebas táctil interactiva.
+* **Hito de Ingeniería:**
+  * **Integración del Driver WS2812:** Incorporamos la biblioteca `Adafruit NeoPixel` y encapsulamos el control del LED físico en el pin GPIO 42 a través de una función de utilidad centralizada `set_led_color(r, g, b)`.
+  * **Sincronización Automática con Klipper:** Programamos un mapeo de colores para reflejar en vivo los estados del sistema:
+    * 🔵 **Azul Rey (`0, 50, 255`):** Impresora en espera / lista (máquina fría).
+    * 🟠 **Naranja (`255, 100, 0`):** Impresora imprimiendo de forma activa (requiere atención).
+    * 🚨 **Rojo Parpadeante:** Impresión pausada por cualquier motivo para alertar de forma prioritaria. Se implementó mediante un oscilador no bloqueante basado en `millis()` cada 500ms en el bucle principal (`loop()`), impidiendo interrupciones o congelamiento de la interfaz LVGL.
+    * 🔴 **Rojo Estático (`220, 20, 60`):** Error de conexión a Moonraker o falla del MCU de la impresora, diferenciándolo de una pausa.
+  * **Panel de Prueba en Configuración:** Agregamos una tarjeta adicional en la pestaña de configuración con botones táctiles para cada color (Rojo, Verde, Azul y Apagar) con notificaciones Toast interactivas para verificar físicamente el funcionamiento del LED en caliente.
+
+
 
 

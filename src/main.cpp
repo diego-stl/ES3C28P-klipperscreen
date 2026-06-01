@@ -6,7 +6,34 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
 #include "config.h"
+
+// Configuración del LED RGB de Estado
+#define LED_PIN 42
+#define LED_COUNT 1
+static Adafruit_NeoPixel status_led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Variables para control de parpadeo no bloqueante del LED
+static bool led_blinking = false;
+static bool led_blink_state = false;
+static unsigned long last_led_blink_time = 0;
+static uint8_t led_blink_r = 0;
+static uint8_t led_blink_g = 0;
+static uint8_t led_blink_b = 0;
+
+void set_led_color(uint8_t r, uint8_t g, uint8_t b) {
+  led_blinking = false; // Detener parpadeo si se establece un color estático
+  status_led.setPixelColor(0, status_led.Color(r, g, b));
+  status_led.show();
+}
+
+void set_led_blink(uint8_t r, uint8_t g, uint8_t b) {
+  led_blinking = true;
+  led_blink_r = r;
+  led_blink_g = g;
+  led_blink_b = b;
+}
 
 // Instancia del controlador de la pantalla
 TFT_eSPI tft = TFT_eSPI();
@@ -130,6 +157,7 @@ static void wifi_save_cb(lv_event_t *e);
 static void wifi_cancel_cb(lv_event_t *e);
 static void printer_save_cb(lv_event_t *e);
 static void printer_cancel_cb(lv_event_t *e);
+static void led_button_event_cb(lv_event_t *e);
 
 /*---------------------------------------------------------------------------
  * HARDWARE CALLBACKS PARA LVGL
@@ -792,19 +820,24 @@ void update_connection_status() {
       if (klipper_state == "error") {
         lv_label_set_text(lbl_badge, "ERROR MCU");
         lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_RED_ACC, 0);
+        set_led_color(220, 20, 60); // Rojo Estático para error de MCU
       } else if (klipper_state == "shutdown") {
         lv_label_set_text(lbl_badge, "SHUTDOWN");
         lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_RED_DARK, 0);
+        set_led_color(220, 20, 60); // Rojo Estático para apagado
       } else if (klipper_state == "startup") {
         lv_label_set_text(lbl_badge, "INICIANDO...");
         lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_SIDEBAR, 0);
+        set_led_color(255, 100, 0); // Naranja para inicio
       } else {
         lv_label_set_text(lbl_badge, "CONECTADO");
         lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_GREEN, 0);
+        set_led_color(0, 50, 255); // Azul Rey para listo/espera (máquina fría)
       }
     } else {
       lv_label_set_text(lbl_badge, "SIN CONEXION");
       lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_RED_DARK, 0);
+      set_led_color(220, 20, 60); // Rojo Estático sin conexión
     }
   }
   
@@ -829,17 +862,21 @@ void update_print_state_badge(const String &state) {
     if (state == "printing") {
       lv_label_set_text(lbl_badge, "IMPRIMIENDO...");
       lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_RED_ACC, 0);
+      set_led_color(255, 100, 0); // Naranja para impresión en curso (prestar atención)
     } else if (state == "paused") {
       lv_label_set_text(lbl_badge, "PAUSADO");
       lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_SIDEBAR, 0);
+      set_led_blink(220, 20, 60); // Rojo Parpadeante para llamar la atención en pausa
     } else if (state == "standby" || state == "ready") {
       lv_label_set_text(lbl_badge, "LISTO");
       lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_GREEN, 0);
+      set_led_color(0, 50, 255); // Azul Rey para listo/espera (máquina fría)
     } else {
       String stateUpper = state;
       stateUpper.toUpperCase();
       lv_label_set_text(lbl_badge, stateUpper.c_str());
       lv_obj_set_style_bg_color(lv_obj_get_parent(lbl_badge), COLOR_GREEN, 0);
+      set_led_color(0, 50, 255); // Azul Rey por defecto para otros estados listos
     }
   }
 }
@@ -1865,6 +1902,26 @@ void create_printer_setup_popup() {
   lv_obj_align(lbl_save, LV_ALIGN_CENTER, 0, 0);
 }
 
+static void led_button_event_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    long color_type = (long)lv_event_get_user_data(e);
+    if (color_type == 1) { // Red
+      set_led_color(255, 0, 0);
+      create_toast("LED RGB", "Color establecido: Rojo");
+    } else if (color_type == 2) { // Green
+      set_led_color(0, 255, 0);
+      create_toast("LED RGB", "Color establecido: Verde");
+    } else if (color_type == 3) { // Blue
+      set_led_color(0, 50, 255); // Azul Rey
+      create_toast("LED RGB", "Color: Azul Rey");
+    } else if (color_type == 0) { // Off
+      set_led_color(0, 0, 0);
+      create_toast("LED RGB", "LED Apagado");
+    }
+  }
+}
+
 void create_config_screen(lv_obj_t *parent) {
   // Convertir parent en scrollable con flex
   lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
@@ -1979,6 +2036,77 @@ void create_config_screen(lv_obj_t *parent) {
   }
   lv_obj_add_event_cb(dd_timeout, timeout_dd_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+  // Separador decorativo 2
+  lv_obj_t *sep2 = lv_obj_create(parent);
+  lv_obj_set_size(sep2, 215, 1);
+  lv_obj_set_style_bg_color(sep2, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(sep2, 0, 0);
+
+  // Tarjeta LED RGB (Control del LED de estado inferior)
+  lv_obj_t *c_led = lv_obj_create(parent);
+  lv_obj_set_size(c_led, 215, 72);
+  lv_obj_set_style_bg_color(c_led, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(c_led, 0, 0);
+  lv_obj_set_style_radius(c_led, 6, 0);
+  lv_obj_set_style_pad_all(c_led, 8, 0);
+
+  lv_obj_t *lbl_led_title = lv_label_create(c_led);
+  lv_label_set_text(lbl_led_title, "LED RGB de Estado:");
+  lv_obj_set_style_text_font(lbl_led_title, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_led_title, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_led_title, LV_ALIGN_TOP_LEFT, 2, 2);
+
+  // Botón Rojo (R)
+  lv_obj_t *btn_red = lv_btn_create(c_led);
+  lv_obj_set_size(btn_red, 42, 26);
+  lv_obj_align(btn_red, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+  lv_obj_set_style_bg_color(btn_red, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_red, 4, 0);
+  lv_obj_add_event_cb(btn_red, led_button_event_cb, LV_EVENT_CLICKED, (void*)1);
+  
+  lv_obj_t *lbl_red = lv_label_create(btn_red);
+  lv_label_set_text(lbl_red, "Rojo");
+  lv_obj_set_style_text_font(lbl_red, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_red, LV_ALIGN_CENTER, 0, 0);
+
+  // Botón Verde (G)
+  lv_obj_t *btn_green = lv_btn_create(c_led);
+  lv_obj_set_size(btn_green, 42, 26);
+  lv_obj_align(btn_green, LV_ALIGN_BOTTOM_LEFT, 50, -2);
+  lv_obj_set_style_bg_color(btn_green, COLOR_GREEN, 0);
+  lv_obj_set_style_radius(btn_green, 4, 0);
+  lv_obj_add_event_cb(btn_green, led_button_event_cb, LV_EVENT_CLICKED, (void*)2);
+
+  lv_obj_t *lbl_green = lv_label_create(btn_green);
+  lv_label_set_text(lbl_green, "Verd");
+  lv_obj_set_style_text_font(lbl_green, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_green, LV_ALIGN_CENTER, 0, 0);
+
+  // Botón Azul (B)
+  lv_obj_t *btn_blue = lv_btn_create(c_led);
+  lv_obj_set_size(btn_blue, 42, 26);
+  lv_obj_align(btn_blue, LV_ALIGN_BOTTOM_LEFT, 98, -2);
+  lv_obj_set_style_bg_color(btn_blue, lv_color_make(41, 128, 185), 0);
+  lv_obj_set_style_radius(btn_blue, 4, 0);
+  lv_obj_add_event_cb(btn_blue, led_button_event_cb, LV_EVENT_CLICKED, (void*)3);
+
+  lv_obj_t *lbl_blue = lv_label_create(btn_blue);
+  lv_label_set_text(lbl_blue, "Azul");
+  lv_obj_set_style_text_font(lbl_blue, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_blue, LV_ALIGN_CENTER, 0, 0);
+
+  // Botón Apagar (Off)
+  lv_obj_t *btn_off = lv_btn_create(c_led);
+  lv_obj_set_size(btn_off, 42, 26);
+  lv_obj_align(btn_off, LV_ALIGN_BOTTOM_LEFT, 146, -2);
+  lv_obj_set_style_bg_color(btn_off, lv_color_make(60, 60, 60), 0);
+  lv_obj_set_style_radius(btn_off, 4, 0);
+  lv_obj_add_event_cb(btn_off, led_button_event_cb, LV_EVENT_CLICKED, (void*)0);
+
+  lv_obj_t *lbl_off = lv_label_create(btn_off);
+  lv_label_set_text(lbl_off, "Off");
+  lv_obj_set_style_text_font(lbl_off, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_off, LV_ALIGN_CENTER, 0, 0);
 
 }
 
@@ -2138,6 +2266,11 @@ void setup() {
   Serial.println("CYD-Klipper Cybertech Red Edition on ESP32-S3");
   Serial.println("=============================================");
 
+  // Inicializar LED RGB de Estado
+  status_led.begin();
+  status_led.setBrightness(60);
+  set_led_color(0, 50, 255); // Iniciar en Azul Rey para indicar inicialización / espera
+
   last_touch_time = millis();
 
   // 1. Inicializar retroiluminación con valor por defecto
@@ -2192,6 +2325,20 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+
+  // Manejar parpadeo no bloqueante del LED de estado
+  if (led_blinking) {
+    if (millis() - last_led_blink_time >= 500) { // Parpadear cada 500ms
+      last_led_blink_time = millis();
+      led_blink_state = !led_blink_state;
+      if (led_blink_state) {
+        status_led.setPixelColor(0, status_led.Color(led_blink_r, led_blink_g, led_blink_b));
+      } else {
+        status_led.setPixelColor(0, status_led.Color(0, 0, 0));
+      }
+      status_led.show();
+    }
+  }
 
   // Control de protector de pantalla (Timeout de inactividad)
   if (screen_timeout_minutes > 0 && !screen_is_off) {
