@@ -38,13 +38,18 @@ static String current_gcode_file = "Ninguno";
 
 // Variables de Configuración de Pantalla
 static int screen_brightness = 100; // Porcentaje de brillo (0-100)
+static int screen_timeout_minutes = 5;   // 0 = Nunca, 1 = 1 Minuto, 5 = 5 Minutos
+static unsigned long last_touch_time = 0;
+static bool screen_is_off = false;
+static lv_obj_t *wifi_setup_overlay = NULL;
+static lv_obj_t *printer_setup_overlay = NULL;
+static lv_obj_t *active_kb = NULL;
 static bool colors_inverted = true;
 
 // Contenedores globales de la UI
 static lv_obj_t *content_area;
 static lv_obj_t *btn_status;
 static lv_obj_t *btn_move;
-static lv_obj_t *btn_temp;
 static lv_obj_t *btn_config;
 static lv_obj_t *btn_files;
 
@@ -92,12 +97,17 @@ static bool reconnect_requested = false;
  *---------------------------------------------------------------------------*/
 void create_status_screen(lv_obj_t *parent);
 void create_move_screen(lv_obj_t *parent);
-void create_temp_screen(lv_obj_t *parent);
 void create_config_screen(lv_obj_t *parent);
 void create_files_screen(lv_obj_t *parent);
+void create_temp_adjust_popup(bool is_nozzle);
 void update_sidebar_selection(int active_tab);
 void update_status_display();
 static void update_temp_display();
+static void update_coord_display();
+static void temp_event_cb(lv_event_t *e);
+static void temp_popup_cb(lv_event_t *e);
+static void temp_popup_overlay_cb(lv_event_t *e);
+static void temp_card_clicked_cb(lv_event_t *e);
 void sendGcodeToMoonraker(const String &gcode);
 void create_cyd_klipper_ui();
 void refresh_status_screen();
@@ -110,6 +120,16 @@ static void action_confirm_cb(lv_event_t *e);
 static void action_cancel_cb(lv_event_t *e);
 static void create_confirm_dialog(const char *title_text, const char *msg_text, long action_type);
 static void gui_pause_estop_cb(lv_event_t *e);
+
+void create_wifi_setup_popup();
+void create_printer_setup_popup();
+static void wifi_card_clicked_cb(lv_event_t *e);
+static void printer_card_clicked_cb(lv_event_t *e);
+static void timeout_dd_event_cb(lv_event_t *e);
+static void wifi_save_cb(lv_event_t *e);
+static void wifi_cancel_cb(lv_event_t *e);
+static void printer_save_cb(lv_event_t *e);
+static void printer_cancel_cb(lv_event_t *e);
 
 /*---------------------------------------------------------------------------
  * HARDWARE CALLBACKS PARA LVGL
@@ -145,6 +165,19 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
   }
 
   if (touched) {
+    last_touch_time = millis(); // Registrar actividad táctil
+
+    if (screen_is_off) {
+      // 1. Despertar la pantalla física al nivel de brillo anterior
+      analogWrite(TFT_BL, map(screen_brightness, 0, 100, 0, 255));
+      screen_is_off = false;
+      Serial.println("[Touch] Despertando pantalla por toque.");
+
+      // 2. Consumir el toque (ignorar primer toque preventivo)
+      data->state = LV_INDEV_STATE_REL;
+      return;
+    }
+
     data->state = LV_INDEV_STATE_PR;
     data->point.x = rawY;
     data->point.y = 240 - rawX;
@@ -160,6 +193,21 @@ static void nav_event_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_CLICKED) {
     lv_obj_t *btn = lv_event_get_target(e);
+    
+    // Limpieza de teclados y diálogos emergentes activos para evitar persistencia huérfana
+    if (active_kb != NULL) {
+      lv_obj_del(active_kb);
+      active_kb = NULL;
+    }
+    if (wifi_setup_overlay != NULL) {
+      lv_obj_del(wifi_setup_overlay);
+      wifi_setup_overlay = NULL;
+    }
+    if (printer_setup_overlay != NULL) {
+      lv_obj_del(printer_setup_overlay);
+      printer_setup_overlay = NULL;
+    }
+
     lv_obj_clean(content_area); // Limpiar pantalla actual
     lbl_badge = NULL;
     lbl_file = NULL;
@@ -180,14 +228,11 @@ static void nav_event_cb(lv_event_t *e) {
     } else if (btn == btn_move) {
       update_sidebar_selection(1);
       create_move_screen(content_area);
-    } else if (btn == btn_temp) {
-      update_sidebar_selection(2);
-      create_temp_screen(content_area);
     } else if (btn == btn_config) {
-      update_sidebar_selection(3);
+      update_sidebar_selection(2);
       create_config_screen(content_area);
     } else if (btn == btn_files) {
-      update_sidebar_selection(4);
+      update_sidebar_selection(3);
       create_files_screen(content_area);
     }
   }
@@ -197,16 +242,14 @@ void update_sidebar_selection(int active_tab) {
   // Resetear estilos a inactivos (Fondo barra lateral oscuro)
   lv_obj_set_style_bg_color(btn_status, COLOR_SIDEBAR, 0);
   lv_obj_set_style_bg_color(btn_move, COLOR_SIDEBAR, 0);
-  lv_obj_set_style_bg_color(btn_temp, COLOR_SIDEBAR, 0);
   lv_obj_set_style_bg_color(btn_config, COLOR_SIDEBAR, 0);
   lv_obj_set_style_bg_color(btn_files, COLOR_SIDEBAR, 0);
 
   // Pintar el botón activo en rojo carmesí brillante
   if (active_tab == 0) lv_obj_set_style_bg_color(btn_status, COLOR_RED_ACC, 0);
   if (active_tab == 1) lv_obj_set_style_bg_color(btn_move, COLOR_RED_ACC, 0);
-  if (active_tab == 2) lv_obj_set_style_bg_color(btn_temp, COLOR_RED_ACC, 0);
-  if (active_tab == 3) lv_obj_set_style_bg_color(btn_config, COLOR_RED_ACC, 0);
-  if (active_tab == 4) lv_obj_set_style_bg_color(btn_files, COLOR_RED_ACC, 0);
+  if (active_tab == 2) lv_obj_set_style_bg_color(btn_config, COLOR_RED_ACC, 0);
+  if (active_tab == 3) lv_obj_set_style_bg_color(btn_files, COLOR_RED_ACC, 0);
 }
 
 void refresh_status_screen() {
@@ -855,7 +898,7 @@ void pollMoonraker() {
   }
 
   // 2. Si Klipper está listo, hacer el query de los objetos de telemetría como de costumbre
-  String path = "/printer/objects/query?extruder&heater_bed&virtual_sdcard&print_stats";
+  String path = "/printer/objects/query?extruder&heater_bed&virtual_sdcard&print_stats&gcode_move";
   String payload = sendHttpRequest("GET", path);
   
   if (payload.isEmpty()) {
@@ -924,10 +967,24 @@ void pollMoonraker() {
           update_print_state_badge(state);
         }
       }
+
+      // Parsear Coordenadas Reales (gcode_move)
+      if (status.containsKey("gcode_move")) {
+        JsonObject gmove = status["gcode_move"].as<JsonObject>();
+        if (gmove.containsKey("gcode_position")) {
+          JsonArray gpos = gmove["gcode_position"].as<JsonArray>();
+          if (gpos.size() >= 3) {
+            pos_x = gpos[0].as<float>();
+            pos_y = gpos[1].as<float>();
+            pos_z = gpos[2].as<float>();
+          }
+        }
+      }
       
       // Actualizar interfaz LVGL
       update_temp_display();
       update_status_display();
+      update_coord_display();
     }
   }
 }
@@ -951,7 +1008,10 @@ void sendGcodeToMoonraker(const String &gcode) {
  *---------------------------------------------------------------------------*/
 
 static void update_coord_display() {
-  lv_label_set_text_fmt(coord_label, "X: %.1f  Y: %.1f  Z: %.2f", pos_x, pos_y, pos_z);
+  if (coord_label != NULL) {
+    String text = "X: " + String(pos_x, 1) + "   Y: " + String(pos_y, 1) + "   Z: " + String(pos_z, 2);
+    lv_label_set_text(coord_label, text.c_str());
+  }
 }
 
 static void jog_event_cb(lv_event_t *e) {
@@ -963,11 +1023,38 @@ static void jog_event_cb(lv_event_t *e) {
     if (dir == 2) { pos_y -= move_step; sendGcodeToMoonraker("G91\nG0 Y-" + String(move_step) + "\nG90"); }  // Y-
     if (dir == 3) { pos_x -= move_step; sendGcodeToMoonraker("G91\nG0 X-" + String(move_step) + "\nG90"); }  // X-
     if (dir == 4) { pos_x += move_step; sendGcodeToMoonraker("G91\nG0 X" + String(move_step) + "\nG90"); }   // X+
-    if (dir == 5) { pos_z += 1.0;       sendGcodeToMoonraker("G91\nG0 Z1.0\nG90"); }                         // Z+
-    if (dir == 6) { pos_z -= 1.0;       sendGcodeToMoonraker("G91\nG0 Z-1.0\nG90"); }                        // Z-
-    if (dir == 7) {                     // Home All
+    if (dir == 5) { // Z+ (safety-capped step size)
+      float z_step = move_step > 10.0 ? 10.0 : move_step;
+      pos_z += z_step;
+      sendGcodeToMoonraker("G91\nG0 Z" + String(z_step) + "\nG90");
+    }
+    if (dir == 6) { // Z- (safety-capped step size)
+      float z_step = move_step > 10.0 ? 10.0 : move_step;
+      pos_z -= z_step;
+      sendGcodeToMoonraker("G91\nG0 Z-" + String(z_step) + "\nG90");
+    }
+    if (dir == 7) { // Home All
       pos_x = 0.0; pos_y = 0.0; pos_z = 0.0;
       sendGcodeToMoonraker("G28");
+    }
+    if (dir == 8) { // Home X
+      pos_x = 0.0;
+      sendGcodeToMoonraker("G28 X");
+    }
+    if (dir == 9) { // Home Y
+      pos_y = 0.0;
+      sendGcodeToMoonraker("G28 Y");
+    }
+    if (dir == 10) { // Home Z
+      pos_z = 0.0;
+      sendGcodeToMoonraker("G28 Z");
+    }
+    if (dir == 11) { // Home XY
+      pos_x = 0.0; pos_y = 0.0;
+      sendGcodeToMoonraker("G28 X Y");
+    }
+    if (dir == 12) { // Desactivar Motores
+      sendGcodeToMoonraker("M84");
     }
     
     // Validar límites lógicos de cama de impresión
@@ -984,113 +1071,281 @@ static void step_event_cb(lv_event_t *e) {
   if (code == LV_EVENT_VALUE_CHANGED) {
     lv_obj_t *btnm = lv_event_get_target(e);
     uint32_t id = lv_btnmatrix_get_selected_btn(btnm);
-    if (id == 0) move_step = 1.0;
-    if (id == 1) move_step = 10.0;
-    if (id == 2) move_step = 50.0;
+    if (id == 0) move_step = 0.1;
+    if (id == 1) move_step = 1.0;
+    if (id == 2) move_step = 10.0;
+    if (id == 3) move_step = 25.0;
+    if (id == 4) move_step = 50.0;
+    if (id == 5) move_step = 100.0;
+  }
+}
+
+// Declaración de los botones de temperatura clickable
+static lv_obj_t *btn_noz_card = NULL;
+static lv_obj_t *btn_bed_card = NULL;
+
+static void temp_card_clicked_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    long is_nozzle = (long)lv_event_get_user_data(e);
+    create_temp_adjust_popup(is_nozzle == 1);
   }
 }
 
 void create_move_screen(lv_obj_t *parent) {
-  // Label Coordenadas
-  coord_label = lv_label_create(parent);
-  lv_obj_set_style_text_font(coord_label, &lv_font_montserrat_16, 0);
+  // Convertir parent en scrollable con flex
+  lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_all(parent, 8, 0);
+  lv_obj_set_style_pad_row(parent, 8, 0);
+  lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_AUTO);
+
+  // 1. Barra de Coordenadas Superior (Ancho 215px, Alto 24px)
+  lv_obj_t *coord_card = lv_obj_create(parent);
+  lv_obj_set_size(coord_card, 215, 24);
+  lv_obj_set_style_bg_color(coord_card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(coord_card, 1, 0);
+  lv_obj_set_style_border_color(coord_card, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(coord_card, 4, 0);
+  lv_obj_set_style_pad_all(coord_card, 0, 0);
+  
+  coord_label = lv_label_create(coord_card);
+  lv_obj_set_style_text_font(coord_label, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(coord_label, lv_color_make(255, 255, 255), 0);
-  lv_obj_align(coord_label, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_align(coord_label, LV_ALIGN_CENTER, 0, 0);
   update_coord_display();
 
-  // Contenedor principal de controles
+  // 2. Contenedor principal de controles de movimiento (D-pad + Z)
   lv_obj_t *ctrl_box = lv_obj_create(parent);
-  lv_obj_set_size(ctrl_box, 230, 185);
-  lv_obj_align(ctrl_box, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(ctrl_box, 215, 105);
   lv_obj_set_style_bg_color(ctrl_box, COLOR_BG, 0);
   lv_obj_set_style_border_width(ctrl_box, 0, 0);
   lv_obj_set_style_pad_all(ctrl_box, 0, 0);
 
   int btn_size = 35;
+  int dpad_offset_x = 15;
+  int z_offset_x = 155;
   
-  // Y+
+  // --- D-PAD X/Y ---
+  // Y+ (Arriba)
   lv_obj_t *btn_yp = lv_btn_create(ctrl_box);
   lv_obj_set_size(btn_yp, btn_size, btn_size);
-  lv_obj_align(btn_yp, LV_ALIGN_TOP_LEFT, 45, 5);
+  lv_obj_align(btn_yp, LV_ALIGN_TOP_LEFT, dpad_offset_x + btn_size, 0);
   lv_obj_set_style_bg_color(btn_yp, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_yp, 4, 0);
+  lv_obj_set_style_pad_all(btn_yp, 0, 0);
   lv_obj_add_event_cb(btn_yp, jog_event_cb, LV_EVENT_CLICKED, (void*)1);
   lv_obj_t *lbl_yp = lv_label_create(btn_yp);
-  lv_label_set_text(lbl_yp, "Y+");
+  lv_label_set_text(lbl_yp, LV_SYMBOL_UP);
   lv_obj_align(lbl_yp, LV_ALIGN_CENTER, 0, 0);
 
-  // Y-
-  lv_obj_t *btn_ym = lv_btn_create(ctrl_box);
-  lv_obj_set_size(btn_ym, btn_size, btn_size);
-  lv_obj_align(btn_ym, LV_ALIGN_TOP_LEFT, 45, 85);
-  lv_obj_set_style_bg_color(btn_ym, COLOR_CARD, 0);
-  lv_obj_add_event_cb(btn_ym, jog_event_cb, LV_EVENT_CLICKED, (void*)2);
-  lv_obj_t *lbl_ym = lv_label_create(btn_ym);
-  lv_label_set_text(lbl_ym, "Y-");
-  lv_obj_align(lbl_ym, LV_ALIGN_CENTER, 0, 0);
-
-  // X-
+  // X- (Izquierda)
   lv_obj_t *btn_xm = lv_btn_create(ctrl_box);
   lv_obj_set_size(btn_xm, btn_size, btn_size);
-  lv_obj_align(btn_xm, LV_ALIGN_TOP_LEFT, 5, 45);
+  lv_obj_align(btn_xm, LV_ALIGN_TOP_LEFT, dpad_offset_x, btn_size);
   lv_obj_set_style_bg_color(btn_xm, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_xm, 4, 0);
+  lv_obj_set_style_pad_all(btn_xm, 0, 0);
   lv_obj_add_event_cb(btn_xm, jog_event_cb, LV_EVENT_CLICKED, (void*)3);
   lv_obj_t *lbl_xm = lv_label_create(btn_xm);
-  lv_label_set_text(lbl_xm, "X-");
+  lv_label_set_text(lbl_xm, LV_SYMBOL_LEFT);
   lv_obj_align(lbl_xm, LV_ALIGN_CENTER, 0, 0);
 
-  // X+
+  // Home XY (Centro) - Rojo carmesí para mantener la estética
+  lv_obj_t *btn_home_xy = lv_btn_create(ctrl_box);
+  lv_obj_set_size(btn_home_xy, btn_size, btn_size);
+  lv_obj_align(btn_home_xy, LV_ALIGN_TOP_LEFT, dpad_offset_x + btn_size, btn_size);
+  lv_obj_set_style_bg_color(btn_home_xy, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_home_xy, 4, 0);
+  lv_obj_set_style_pad_all(btn_home_xy, 0, 0);
+  lv_obj_add_event_cb(btn_home_xy, jog_event_cb, LV_EVENT_CLICKED, (void*)11);
+  lv_obj_t *lbl_home_xy = lv_label_create(btn_home_xy);
+  lv_label_set_text(lbl_home_xy, LV_SYMBOL_HOME);
+  lv_obj_align(lbl_home_xy, LV_ALIGN_CENTER, 0, 0);
+
+  // X+ (Derecha)
   lv_obj_t *btn_xp = lv_btn_create(ctrl_box);
   lv_obj_set_size(btn_xp, btn_size, btn_size);
-  lv_obj_align(btn_xp, LV_ALIGN_TOP_LEFT, 85, 45);
+  lv_obj_align(btn_xp, LV_ALIGN_TOP_LEFT, dpad_offset_x + btn_size * 2, btn_size);
   lv_obj_set_style_bg_color(btn_xp, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_xp, 4, 0);
+  lv_obj_set_style_pad_all(btn_xp, 0, 0);
   lv_obj_add_event_cb(btn_xp, jog_event_cb, LV_EVENT_CLICKED, (void*)4);
   lv_obj_t *lbl_xp = lv_label_create(btn_xp);
-  lv_label_set_text(lbl_xp, "X+");
+  lv_label_set_text(lbl_xp, LV_SYMBOL_RIGHT);
   lv_obj_align(lbl_xp, LV_ALIGN_CENTER, 0, 0);
 
-  // Home All (Centro del D-pad)
-  lv_obj_t *btn_home = lv_btn_create(ctrl_box);
-  lv_obj_set_size(btn_home, btn_size, btn_size);
-  lv_obj_align(btn_home, LV_ALIGN_TOP_LEFT, 45, 45);
-  lv_obj_set_style_bg_color(btn_home, COLOR_RED_ACC, 0);
-  lv_obj_add_event_cb(btn_home, jog_event_cb, LV_EVENT_CLICKED, (void*)7);
-  lv_obj_t *lbl_home = lv_label_create(btn_home);
-  lv_label_set_text(lbl_home, "H");
-  lv_obj_align(lbl_home, LV_ALIGN_CENTER, 0, 0);
+  // Y- (Abajo)
+  lv_obj_t *btn_ym = lv_btn_create(ctrl_box);
+  lv_obj_set_size(btn_ym, btn_size, btn_size);
+  lv_obj_align(btn_ym, LV_ALIGN_TOP_LEFT, dpad_offset_x + btn_size, btn_size * 2);
+  lv_obj_set_style_bg_color(btn_ym, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_ym, 4, 0);
+  lv_obj_set_style_pad_all(btn_ym, 0, 0);
+  lv_obj_add_event_cb(btn_ym, jog_event_cb, LV_EVENT_CLICKED, (void*)2);
+  lv_obj_t *lbl_ym = lv_label_create(btn_ym);
+  lv_label_set_text(lbl_ym, LV_SYMBOL_DOWN);
+  lv_obj_align(lbl_ym, LV_ALIGN_CENTER, 0, 0);
 
   // --- CONTROLES DE Z ---
-  // Z+
+  // Z Up (Arriba)
   lv_obj_t *btn_zp = lv_btn_create(ctrl_box);
-  lv_obj_set_size(btn_zp, btn_size + 5, btn_size);
-  lv_obj_align(btn_zp, LV_ALIGN_TOP_RIGHT, -15, 10);
+  lv_obj_set_size(btn_zp, btn_size, btn_size);
+  lv_obj_align(btn_zp, LV_ALIGN_TOP_LEFT, z_offset_x, 0);
   lv_obj_set_style_bg_color(btn_zp, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_zp, 4, 0);
+  lv_obj_set_style_pad_all(btn_zp, 0, 0);
   lv_obj_add_event_cb(btn_zp, jog_event_cb, LV_EVENT_CLICKED, (void*)5);
   lv_obj_t *lbl_zp = lv_label_create(btn_zp);
-  lv_label_set_text(lbl_zp, "Z+");
+  lv_label_set_text(lbl_zp, LV_SYMBOL_UP);
   lv_obj_align(lbl_zp, LV_ALIGN_CENTER, 0, 0);
 
-  // Z-
+  // Z Home (Centro) - Rojo carmesí para mantener la estética
+  lv_obj_t *btn_home_z = lv_btn_create(ctrl_box);
+  lv_obj_set_size(btn_home_z, btn_size, btn_size);
+  lv_obj_align(btn_home_z, LV_ALIGN_TOP_LEFT, z_offset_x, btn_size);
+  lv_obj_set_style_bg_color(btn_home_z, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_home_z, 4, 0);
+  lv_obj_set_style_pad_all(btn_home_z, 0, 0);
+  lv_obj_add_event_cb(btn_home_z, jog_event_cb, LV_EVENT_CLICKED, (void*)10);
+  lv_obj_t *lbl_home_z = lv_label_create(btn_home_z);
+  lv_label_set_text(lbl_home_z, LV_SYMBOL_HOME);
+  lv_obj_align(lbl_home_z, LV_ALIGN_CENTER, 0, 0);
+
+  // Z Down (Abajo)
   lv_obj_t *btn_zm = lv_btn_create(ctrl_box);
-  lv_obj_set_size(btn_zm, btn_size + 5, btn_size);
-  lv_obj_align(btn_zm, LV_ALIGN_TOP_RIGHT, -15, 65);
+  lv_obj_set_size(btn_zm, btn_size, btn_size);
+  lv_obj_align(btn_zm, LV_ALIGN_TOP_LEFT, z_offset_x, btn_size * 2);
   lv_obj_set_style_bg_color(btn_zm, COLOR_CARD, 0);
+  lv_obj_set_style_radius(btn_zm, 4, 0);
+  lv_obj_set_style_pad_all(btn_zm, 0, 0);
   lv_obj_add_event_cb(btn_zm, jog_event_cb, LV_EVENT_CLICKED, (void*)6);
   lv_obj_t *lbl_zm = lv_label_create(btn_zm);
-  lv_label_set_text(lbl_zm, "Z-");
+  lv_label_set_text(lbl_zm, LV_SYMBOL_DOWN);
   lv_obj_align(lbl_zm, LV_ALIGN_CENTER, 0, 0);
 
-  // --- BOTONERA DE PASO (STEP) ---
-  static const char *btnm_map[] = {"1 mm", "10 mm", "50 mm", ""};
-  lv_obj_t *btnm = lv_btnmatrix_create(ctrl_box);
-  lv_obj_set_size(btnm, 210, 32);
-  lv_obj_align(btnm, LV_ALIGN_BOTTOM_MID, 0, -5);
+  // 3. Matriz de Pasos Step (Ancho 215px, Alto 30px)
+  static const char *btnm_map[] = {"0.1", "1", "10", "25", "50", "100", ""};
+  lv_obj_t *btnm = lv_btnmatrix_create(parent);
+  lv_obj_set_size(btnm, 215, 30);
   lv_btnmatrix_set_map(btnm, btnm_map);
   lv_obj_set_style_bg_color(btnm, COLOR_BG, 0);
   lv_obj_set_style_border_width(btnm, 0, 0);
+  lv_obj_set_style_pad_all(btnm, 0, 0);
   
-  lv_btnmatrix_set_btn_ctrl(btnm, 1, LV_BTNMATRIX_CTRL_CHECKED);
+  // Establecer el botón inicial checked (por defecto 10 mm)
+  lv_btnmatrix_set_btn_ctrl(btnm, 2, LV_BTNMATRIX_CTRL_CHECKED);
   lv_btnmatrix_set_one_checked(btnm, true);
   lv_obj_add_event_cb(btnm, step_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // 4. Homing General y Motores Off (Fila horizontal de dos botones)
+  lv_obj_t *homing_box = lv_obj_create(parent);
+  lv_obj_set_size(homing_box, 215, 34);
+  lv_obj_set_style_bg_color(homing_box, COLOR_BG, 0);
+  lv_obj_set_style_border_width(homing_box, 0, 0);
+  lv_obj_set_style_pad_all(homing_box, 0, 0);
+
+  // Botón Home Todos (Rojo Carmesí)
+  lv_obj_t *btn_home_all = lv_btn_create(homing_box);
+  lv_obj_set_size(btn_home_all, 102, 34);
+  lv_obj_align(btn_home_all, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(btn_home_all, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_home_all, 4, 0);
+  lv_obj_set_style_pad_all(btn_home_all, 0, 0);
+  lv_obj_add_event_cb(btn_home_all, jog_event_cb, LV_EVENT_CLICKED, (void*)7);
+  lv_obj_t *lbl_home_all = lv_label_create(btn_home_all);
+  lv_label_set_text(lbl_home_all, LV_SYMBOL_HOME " TODOS");
+  lv_obj_set_style_text_font(lbl_home_all, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_home_all, LV_ALIGN_CENTER, 0, 0);
+
+  // Botón Desactivar Motores (Fondo oscuro con borde rojo carmesí)
+  lv_obj_t *btn_motors_off = lv_btn_create(homing_box);
+  lv_obj_set_size(btn_motors_off, 102, 34);
+  lv_obj_align(btn_motors_off, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(btn_motors_off, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_border_width(btn_motors_off, 1, 0);
+  lv_obj_set_style_border_color(btn_motors_off, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_motors_off, 4, 0);
+  lv_obj_set_style_pad_all(btn_motors_off, 0, 0);
+  lv_obj_add_event_cb(btn_motors_off, jog_event_cb, LV_EVENT_CLICKED, (void*)12);
+  lv_obj_t *lbl_motors_off = lv_label_create(btn_motors_off);
+  lv_label_set_text(lbl_motors_off, "Motores Off");
+  lv_obj_set_style_text_font(lbl_motors_off, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_motors_off, LV_ALIGN_CENTER, 0, 0);
+
+  // Separador Visual e Indicador de Sección de Temperatura
+  lv_obj_t *sep = lv_obj_create(parent);
+  lv_obj_set_size(sep, 215, 1);
+  lv_obj_set_style_bg_color(sep, COLOR_RED_DARK, 0);
+  lv_obj_set_style_border_width(sep, 0, 0);
+  lv_obj_set_style_pad_all(sep, 0, 0);
+
+  // 5. Tarjetas de Temperatura Clickable (Fila horizontal de dos botones)
+  lv_obj_t *temp_box = lv_obj_create(parent);
+  lv_obj_set_size(temp_box, 215, 36);
+  lv_obj_set_style_bg_color(temp_box, COLOR_BG, 0);
+  lv_obj_set_style_border_width(temp_box, 0, 0);
+  lv_obj_set_style_pad_all(temp_box, 0, 0);
+
+  // Tarjeta Boquilla
+  btn_noz_card = lv_btn_create(temp_box);
+  lv_obj_set_size(btn_noz_card, 102, 36);
+  lv_obj_align(btn_noz_card, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(btn_noz_card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(btn_noz_card, 0, 0);
+  lv_obj_set_style_radius(btn_noz_card, 6, 0);
+  lv_obj_set_style_pad_all(btn_noz_card, 4, 0);
+  lv_obj_add_event_cb(btn_noz_card, temp_card_clicked_cb, LV_EVENT_CLICKED, (void*)1);
+  
+  lbl_noz = lv_label_create(btn_noz_card);
+  lv_obj_set_style_text_font(lbl_noz, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_noz, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_noz, LV_ALIGN_CENTER, 0, 0);
+
+  // Tarjeta Cama
+  btn_bed_card = lv_btn_create(temp_box);
+  lv_obj_set_size(btn_bed_card, 102, 36);
+  lv_obj_align(btn_bed_card, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(btn_bed_card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(btn_bed_card, 0, 0);
+  lv_obj_set_style_radius(btn_bed_card, 6, 0);
+  lv_obj_set_style_pad_all(btn_bed_card, 4, 0);
+  lv_obj_add_event_cb(btn_bed_card, temp_card_clicked_cb, LV_EVENT_CLICKED, (void*)2);
+  
+  lbl_bed = lv_label_create(btn_bed_card);
+  lv_obj_set_style_text_font(lbl_bed, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_bed, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_bed, LV_ALIGN_CENTER, 0, 0);
+
+  // 6. Presets Térmicos PLA / Enfriar (Fila horizontal de dos botones)
+  lv_obj_t *preset_box = lv_obj_create(parent);
+  lv_obj_set_size(preset_box, 215, 36);
+  lv_obj_set_style_bg_color(preset_box, COLOR_BG, 0);
+  lv_obj_set_style_border_width(preset_box, 0, 0);
+  lv_obj_set_style_pad_all(preset_box, 0, 0);
+
+  lv_obj_t *btn_pre = lv_btn_create(preset_box);
+  lv_obj_set_size(btn_pre, 102, 36);
+  lv_obj_align(btn_pre, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(btn_pre, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_pre, 4, 0);
+  lv_obj_add_event_cb(btn_pre, temp_event_cb, LV_EVENT_CLICKED, (void*)5);
+  lv_obj_t *lbl_pre = lv_label_create(btn_pre);
+  lv_label_set_text(lbl_pre, "Precal PLA");
+  lv_obj_set_style_text_font(lbl_pre, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_pre, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *btn_cool = lv_btn_create(preset_box);
+  lv_obj_set_size(btn_cool, 102, 36);
+  lv_obj_align(btn_cool, LV_ALIGN_TOP_RIGHT, 0, 0);
+  lv_obj_set_style_bg_color(btn_cool, COLOR_RED_DARK, 0);
+  lv_obj_set_style_radius(btn_cool, 4, 0);
+  lv_obj_add_event_cb(btn_cool, temp_event_cb, LV_EVENT_CLICKED, (void*)6);
+  lv_obj_t *lbl_cool = lv_label_create(btn_cool);
+  lv_label_set_text(lbl_cool, "Enfriar");
+  lv_obj_set_style_text_font(lbl_cool, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_cool, LV_ALIGN_CENTER, 0, 0);
+
+  update_temp_display();
 }
 
 /*---------------------------------------------------------------------------
@@ -1099,20 +1354,194 @@ void create_move_screen(lv_obj_t *parent) {
 
 static void update_temp_display() {
   if (lbl_noz != NULL && lbl_bed != NULL) {
-    lv_label_set_text_fmt(lbl_noz, "Boquilla: %d°C / %d°C", nozzle_temp, nozzle_target);
-    lv_label_set_text_fmt(lbl_bed, "Cama: %d°C / %d°C", bed_temp, bed_target);
+    lv_label_set_text_fmt(lbl_noz, "Boq: %d° / %d°", nozzle_temp, nozzle_target);
+    lv_label_set_text_fmt(lbl_bed, "Cama: %d° / %d°", bed_temp, bed_target);
   }
+}
+
+// Variables para rastrear el popup activo
+static lv_obj_t *temp_popup_overlay = NULL;
+static lv_obj_t *lbl_popup_val = NULL;
+static bool popup_for_nozzle = true;
+
+static void temp_popup_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    long val = (long)lv_event_get_user_data(e);
+    
+    if (val == 999) { // Cerrar / Aceptar
+      if (temp_popup_overlay != NULL) {
+        lv_obj_del(temp_popup_overlay);
+        temp_popup_overlay = NULL;
+        lbl_popup_val = NULL;
+      }
+      return;
+    }
+    
+    if (popup_for_nozzle) {
+      if (val == 0) {
+        nozzle_target = 0;
+      } else {
+        nozzle_target += val;
+      }
+      if (nozzle_target < 0) nozzle_target = 0;
+      if (nozzle_target > 280) nozzle_target = 280;
+      
+      sendGcodeToMoonraker("M104 S" + String(nozzle_target));
+      if (lbl_popup_val != NULL) {
+        lv_label_set_text_fmt(lbl_popup_val, "%d°C", nozzle_target);
+      }
+    } else {
+      if (val == 0) {
+        bed_target = 0;
+      } else {
+        bed_target += val;
+      }
+      if (bed_target < 0) bed_target = 0;
+      if (bed_target > 110) bed_target = 110;
+      
+      sendGcodeToMoonraker("M140 S" + String(bed_target));
+      if (lbl_popup_val != NULL) {
+        lv_label_set_text_fmt(lbl_popup_val, "%d°C", bed_target);
+      }
+    }
+    update_temp_display();
+  }
+}
+
+// Clic en el fondo backdrop para cerrar
+static void temp_popup_overlay_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    lv_obj_t *target = lv_event_get_target(e);
+    if (target == temp_popup_overlay) {
+      lv_obj_del(temp_popup_overlay);
+      temp_popup_overlay = NULL;
+      lbl_popup_val = NULL;
+    }
+  }
+}
+
+void create_temp_adjust_popup(bool is_nozzle) {
+  popup_for_nozzle = is_nozzle;
+  
+  // 1. Backdrop overlay
+  temp_popup_overlay = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(temp_popup_overlay, 320, 240);
+  lv_obj_align(temp_popup_overlay, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(temp_popup_overlay, lv_color_make(0, 0, 0), 0);
+  lv_obj_set_style_bg_opa(temp_popup_overlay, LV_OPA_60, 0);
+  lv_obj_set_style_border_width(temp_popup_overlay, 0, 0);
+  lv_obj_set_style_radius(temp_popup_overlay, 0, 0);
+  lv_obj_add_event_cb(temp_popup_overlay, temp_popup_overlay_cb, LV_EVENT_CLICKED, NULL);
+  
+  // 2. Tarjeta del Diálogo
+  lv_obj_t *card = lv_obj_create(temp_popup_overlay);
+  lv_obj_set_size(card, 220, 140);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(card, 1, 0);
+  lv_obj_set_style_border_color(card, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(card, 8, 0);
+  lv_obj_set_style_pad_all(card, 6, 0);
+  
+  // Título del Dialogo
+  lv_obj_t *lbl_title = lv_label_create(card);
+  lv_label_set_text(lbl_title, is_nozzle ? "Ajustar Boquilla" : "Ajustar Cama");
+  lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_title, COLOR_GREY_TEXT, 0);
+  lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 2);
+  
+  // Valor objetivo destacado
+  lbl_popup_val = lv_label_create(card);
+  lv_label_set_text_fmt(lbl_popup_val, "%d°C", is_nozzle ? nozzle_target : bed_target);
+  lv_obj_set_style_text_font(lbl_popup_val, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_popup_val, COLOR_RED_ACC, 0);
+  lv_obj_align(lbl_popup_val, LV_ALIGN_TOP_MID, 0, 20);
+  
+  // Botonera de incrementos
+  int btn_w = 42;
+  int btn_h = 30;
+  int btn_y = 52;
+  
+  // -10
+  lv_obj_t *b_m10 = lv_btn_create(card);
+  lv_obj_set_size(b_m10, btn_w, btn_h);
+  lv_obj_align(b_m10, LV_ALIGN_TOP_LEFT, 4, btn_y);
+  lv_obj_set_style_bg_color(b_m10, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_radius(b_m10, 4, 0);
+  lv_obj_add_event_cb(b_m10, temp_popup_cb, LV_EVENT_CLICKED, (void*)-10);
+  lv_obj_t *l_m10 = lv_label_create(b_m10);
+  lv_label_set_text(l_m10, "-10");
+  lv_obj_set_style_text_font(l_m10, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_m10, LV_ALIGN_CENTER, 0, 0);
+  
+  // -5
+  lv_obj_t *b_m5 = lv_btn_create(card);
+  lv_obj_set_size(b_m5, btn_w, btn_h);
+  lv_obj_align(b_m5, LV_ALIGN_TOP_LEFT, 52, btn_y);
+  lv_obj_set_style_bg_color(b_m5, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_radius(b_m5, 4, 0);
+  lv_obj_add_event_cb(b_m5, temp_popup_cb, LV_EVENT_CLICKED, (void*)-5);
+  lv_obj_t *l_m5 = lv_label_create(b_m5);
+  lv_label_set_text(l_m5, "-5");
+  lv_obj_set_style_text_font(l_m5, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_m5, LV_ALIGN_CENTER, 0, 0);
+  
+  // +5
+  lv_obj_t *b_p5 = lv_btn_create(card);
+  lv_obj_set_size(b_p5, btn_w, btn_h);
+  lv_obj_align(b_p5, LV_ALIGN_TOP_LEFT, 110, btn_y);
+  lv_obj_set_style_bg_color(b_p5, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(b_p5, 4, 0);
+  lv_obj_add_event_cb(b_p5, temp_popup_cb, LV_EVENT_CLICKED, (void*)5);
+  lv_obj_t *l_p5 = lv_label_create(b_p5);
+  lv_label_set_text(l_p5, "+5");
+  lv_obj_set_style_text_font(l_p5, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_p5, LV_ALIGN_CENTER, 0, 0);
+  
+  // +10
+  lv_obj_t *b_p10 = lv_btn_create(card);
+  lv_obj_set_size(b_p10, btn_w, btn_h);
+  lv_obj_align(b_p10, LV_ALIGN_TOP_LEFT, 158, btn_y);
+  lv_obj_set_style_bg_color(b_p10, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(b_p10, 4, 0);
+  lv_obj_add_event_cb(b_p10, temp_popup_cb, LV_EVENT_CLICKED, (void*)10);
+  lv_obj_t *l_p10 = lv_label_create(b_p10);
+  lv_label_set_text(l_p10, "+10");
+  lv_obj_set_style_text_font(l_p10, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_p10, LV_ALIGN_CENTER, 0, 0);
+  
+  // Fila inferior (Apagar y Aceptar)
+  lv_obj_t *b_off = lv_btn_create(card);
+  lv_obj_set_size(b_off, 75, 32);
+  lv_obj_align(b_off, LV_ALIGN_BOTTOM_LEFT, 10, -4);
+  lv_obj_set_style_bg_color(b_off, COLOR_RED_DARK, 0);
+  lv_obj_set_style_radius(b_off, 4, 0);
+  lv_obj_add_event_cb(b_off, temp_popup_cb, LV_EVENT_CLICKED, (void*)0);
+  lv_obj_t *l_off = lv_label_create(b_off);
+  lv_label_set_text(l_off, "Apagar");
+  lv_obj_set_style_text_font(l_off, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_off, LV_ALIGN_CENTER, 0, 0);
+  
+  lv_obj_t *b_ok = lv_btn_create(card);
+  lv_obj_set_size(b_ok, 95, 32);
+  lv_obj_align(b_ok, LV_ALIGN_BOTTOM_RIGHT, -10, -4);
+  lv_obj_set_style_bg_color(b_ok, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_border_color(b_ok, COLOR_RED_ACC, 0);
+  lv_obj_set_style_border_width(b_ok, 1, 0);
+  lv_obj_set_style_radius(b_ok, 4, 0);
+  lv_obj_add_event_cb(b_ok, temp_popup_cb, LV_EVENT_CLICKED, (void*)999);
+  lv_obj_t *l_ok = lv_label_create(b_ok);
+  lv_label_set_text(l_ok, "Aceptar");
+  lv_obj_set_style_text_font(l_ok, &lv_font_montserrat_14, 0);
+  lv_obj_align(l_ok, LV_ALIGN_CENTER, 0, 0);
 }
 
 static void temp_event_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_CLICKED) {
     long act = (long)lv_event_get_user_data(e);
-    
-    if (act == 1) nozzle_target += 5; // Noz +5
-    if (act == 2) nozzle_target -= 5; // Noz -5
-    if (act == 3) bed_target += 5;    // Bed +5
-    if (act == 4) bed_target -= 5;    // Bed -5
     
     if (act == 5) { // Preheat PLA
       nozzle_target = 210;
@@ -1128,105 +1557,8 @@ static void temp_event_cb(lv_event_t *e) {
       sendGcodeToMoonraker("M140 S0");
     }
 
-    if (nozzle_target < 0) nozzle_target = 0;
-    if (bed_target < 0) bed_target = 0;
-
-    if (act == 1 || act == 2) {
-      sendGcodeToMoonraker("M104 S" + String(nozzle_target));
-    }
-    if (act == 3 || act == 4) {
-      sendGcodeToMoonraker("M140 S" + String(bed_target));
-    }
-
     update_temp_display();
   }
-}
-
-void create_temp_screen(lv_obj_t *parent) {
-  // Boquilla Card
-  lv_obj_t *c_noz = lv_obj_create(parent);
-  lv_obj_set_size(c_noz, 220, 52);
-  lv_obj_align(c_noz, LV_ALIGN_TOP_MID, 0, 5);
-  lv_obj_set_style_bg_color(c_noz, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(c_noz, 0, 0);
-  lv_obj_set_style_radius(c_noz, 6, 0);
-  lv_obj_set_style_pad_all(c_noz, 4, 0);
-
-  lbl_noz = lv_label_create(c_noz);
-  lv_obj_set_style_text_font(lbl_noz, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_noz, LV_ALIGN_LEFT_MID, 5, 0);
-
-  lv_obj_t *btn_noz_p = lv_btn_create(c_noz);
-  lv_obj_set_size(btn_noz_p, 36, 32);
-  lv_obj_align(btn_noz_p, LV_ALIGN_RIGHT_MID, -45, 0);
-  lv_obj_set_style_bg_color(btn_noz_p, COLOR_RED_ACC, 0);
-  lv_obj_add_event_cb(btn_noz_p, temp_event_cb, LV_EVENT_CLICKED, (void*)1);
-  lv_obj_t *l_np = lv_label_create(btn_noz_p);
-  lv_label_set_text(l_np, "+");
-  lv_obj_align(l_np, LV_ALIGN_CENTER, 0, 0);
-
-  lv_obj_t *btn_noz_m = lv_btn_create(c_noz);
-  lv_obj_set_size(btn_noz_m, 36, 32);
-  lv_obj_align(btn_noz_m, LV_ALIGN_RIGHT_MID, -5, 0);
-  lv_obj_set_style_bg_color(btn_noz_m, COLOR_SIDEBAR, 0);
-  lv_obj_add_event_cb(btn_noz_m, temp_event_cb, LV_EVENT_CLICKED, (void*)2);
-  lv_obj_t *l_nm = lv_label_create(btn_noz_m);
-  lv_label_set_text(l_nm, "-");
-  lv_obj_align(l_nm, LV_ALIGN_CENTER, 0, 0);
-
-  // Cama Card
-  lv_obj_t *c_bed = lv_obj_create(parent);
-  lv_obj_set_size(c_bed, 220, 52);
-  lv_obj_align(c_bed, LV_ALIGN_TOP_MID, 0, 62);
-  lv_obj_set_style_bg_color(c_bed, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(c_bed, 0, 0);
-  lv_obj_set_style_radius(c_bed, 6, 0);
-  lv_obj_set_style_pad_all(c_bed, 4, 0);
-
-  lbl_bed = lv_label_create(c_bed);
-  lv_obj_set_style_text_font(lbl_bed, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_bed, LV_ALIGN_LEFT_MID, 5, 0);
-
-  lv_obj_t *btn_bed_p = lv_btn_create(c_bed);
-  lv_obj_set_size(btn_bed_p, 36, 32);
-  lv_obj_align(btn_bed_p, LV_ALIGN_RIGHT_MID, -45, 0);
-  lv_obj_set_style_bg_color(btn_bed_p, COLOR_RED_ACC, 0);
-  lv_obj_add_event_cb(btn_bed_p, temp_event_cb, LV_EVENT_CLICKED, (void*)3);
-  lv_obj_t *l_bp = lv_label_create(btn_bed_p);
-  lv_label_set_text(l_bp, "+");
-  lv_obj_align(l_bp, LV_ALIGN_CENTER, 0, 0);
-
-  lv_obj_t *btn_bed_m = lv_btn_create(c_bed);
-  lv_obj_set_size(btn_bed_m, 36, 32);
-  lv_obj_align(btn_bed_m, LV_ALIGN_RIGHT_MID, -5, 0);
-  lv_obj_set_style_bg_color(btn_bed_m, COLOR_SIDEBAR, 0);
-  lv_obj_add_event_cb(btn_bed_m, temp_event_cb, LV_EVENT_CLICKED, (void*)4);
-  lv_obj_t *l_bm = lv_label_create(btn_bed_m);
-  lv_label_set_text(l_bm, "-");
-  lv_obj_align(l_bm, LV_ALIGN_CENTER, 0, 0);
-
-  // Botones de presets
-  lv_obj_t *btn_pre = lv_btn_create(parent);
-  lv_obj_set_size(btn_pre, 105, 36);
-  lv_obj_align(btn_pre, LV_ALIGN_BOTTOM_LEFT, 5, -10);
-  lv_obj_set_style_bg_color(btn_pre, COLOR_RED_ACC, 0);
-  lv_obj_add_event_cb(btn_pre, temp_event_cb, LV_EVENT_CLICKED, (void*)5);
-  lv_obj_t *lbl_pre = lv_label_create(btn_pre);
-  lv_label_set_text(lbl_pre, "Precal PLA");
-  lv_obj_set_style_text_font(lbl_pre, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_pre, LV_ALIGN_CENTER, 0, 0);
-
-  lv_obj_t *btn_cool = lv_btn_create(parent);
-  lv_obj_set_size(btn_cool, 105, 36);
-  lv_obj_align(btn_cool, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
-  lv_obj_set_style_bg_color(btn_cool, COLOR_RED_DARK, 0);
-  lv_obj_add_event_cb(btn_cool, temp_event_cb, LV_EVENT_CLICKED, (void*)6);
-  lv_obj_t *lbl_cool = lv_label_create(btn_cool);
-  lv_label_set_text(lbl_cool, "Enfriar");
-  lv_obj_set_style_text_font(lbl_cool, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_cool, LV_ALIGN_CENTER, 0, 0);
-
-  update_temp_display();
 }
 
 /*---------------------------------------------------------------------------
@@ -1253,6 +1585,9 @@ static void kb_event_cb(lv_event_t *e) {
   lv_obj_t *kb = lv_event_get_target(e);
   if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
     lv_obj_del(kb);
+    if (kb == active_kb) {
+      active_kb = NULL;
+    }
   }
 }
 
@@ -1260,9 +1595,13 @@ static void ta_event_cb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   lv_obj_t *ta = lv_event_get_target(e);
   if (code == LV_EVENT_FOCUSED) {
-    lv_obj_t *kb = lv_keyboard_create(lv_scr_act());
-    lv_keyboard_set_textarea(kb, ta);
-    lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_ALL, NULL);
+    if (active_kb != NULL) {
+      lv_obj_del(active_kb);
+      active_kb = NULL;
+    }
+    active_kb = lv_keyboard_create(lv_scr_act());
+    lv_keyboard_set_textarea(active_kb, ta);
+    lv_obj_add_event_cb(active_kb, kb_event_cb, LV_EVENT_ALL, NULL);
   }
 }
 
@@ -1270,15 +1609,56 @@ static lv_obj_t *ta_ssid;
 static lv_obj_t *ta_pass;
 static lv_obj_t *ta_ip;
 
-static void connect_save_btn_event_cb(lv_event_t *e) {
-  lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_CLICKED) {
+// Wi-Fi Popup cancel/save callbacks
+static void wifi_cancel_cb(lv_event_t *e) {
+  if (active_kb != NULL) {
+    lv_obj_del(active_kb);
+    active_kb = NULL;
+  }
+  if (wifi_setup_overlay != NULL) {
+    lv_obj_del(wifi_setup_overlay);
+    wifi_setup_overlay = NULL;
+  }
+}
+
+static void wifi_save_cb(lv_event_t *e) {
+  if (active_kb != NULL) {
+    lv_obj_del(active_kb);
+    active_kb = NULL;
+  }
+  if (ta_ssid != NULL && ta_pass != NULL) {
     wifi_ssid_str = String(lv_textarea_get_text(ta_ssid));
     wifi_pass_str = String(lv_textarea_get_text(ta_pass));
-    moonraker_host_str = String(lv_textarea_get_text(ta_ip));
-    
     wifi_ssid_str.trim();
     wifi_pass_str.trim();
+    reconnect_requested = true;
+    create_toast("Wi-Fi", "Guardando y reconectando...");
+  }
+  if (wifi_setup_overlay != NULL) {
+    lv_obj_del(wifi_setup_overlay);
+    wifi_setup_overlay = NULL;
+  }
+}
+
+// Printer Popup cancel/save callbacks
+static void printer_cancel_cb(lv_event_t *e) {
+  if (active_kb != NULL) {
+    lv_obj_del(active_kb);
+    active_kb = NULL;
+  }
+  if (printer_setup_overlay != NULL) {
+    lv_obj_del(printer_setup_overlay);
+    printer_setup_overlay = NULL;
+  }
+}
+
+static void printer_save_cb(lv_event_t *e) {
+  if (active_kb != NULL) {
+    lv_obj_del(active_kb);
+    active_kb = NULL;
+  }
+  if (ta_ip != NULL) {
+    moonraker_host_str = String(lv_textarea_get_text(ta_ip));
     moonraker_host_str.trim();
 
     // Limpiar IP de prefijos y sufijos de forma inteligente
@@ -1306,13 +1686,183 @@ static void connect_save_btn_event_cb(lv_event_t *e) {
     }
     
     moonraker_host_str.trim();
-    
     reconnect_requested = true;
-    Serial.printf("[Config] Nuevos parametros guardados. Host: %s, Puerto: %d. Solicitando reconexion...\n", moonraker_host_str.c_str(), moonraker_port_int);
-    
-    // Crear toast con cierre al tocar en cualquier lado de la pantalla
-    create_toast("Configuracion", "Guardando y reconectando...");
+    create_toast("Impresora", "Guardando y reconectando...");
   }
+  if (printer_setup_overlay != NULL) {
+    lv_obj_del(printer_setup_overlay);
+    printer_setup_overlay = NULL;
+  }
+}
+
+// Timeout dropdown callback
+static void timeout_dd_event_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_VALUE_CHANGED) {
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint16_t selected = lv_dropdown_get_selected(dd);
+    if (selected == 0) {
+      screen_timeout_minutes = 0; // Nunca
+    } else if (selected == 1) {
+      screen_timeout_minutes = 1; // 1 Min
+    } else if (selected == 2) {
+      screen_timeout_minutes = 5; // 5 Min
+    }
+    last_touch_time = millis(); // Refrescar timer
+    Serial.printf("[Config] Timeout cambiado a: %d min\n", screen_timeout_minutes);
+  }
+}
+
+// Card Clicked callbacks
+static void wifi_card_clicked_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    create_wifi_setup_popup();
+  }
+}
+
+static void printer_card_clicked_cb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_CLICKED) {
+    create_printer_setup_popup();
+  }
+}
+
+// Create Wi-Fi setup popup
+void create_wifi_setup_popup() {
+  if (wifi_setup_overlay != NULL) return;
+
+  wifi_setup_overlay = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(wifi_setup_overlay, 320, 240);
+  lv_obj_set_style_bg_color(wifi_setup_overlay, lv_color_make(0, 0, 0), 0);
+  lv_obj_set_style_bg_opa(wifi_setup_overlay, LV_OPA_70, 0);
+  lv_obj_set_style_border_width(wifi_setup_overlay, 0, 0);
+  lv_obj_set_style_radius(wifi_setup_overlay, 0, 0);
+  lv_obj_align(wifi_setup_overlay, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *dialog = lv_obj_create(wifi_setup_overlay);
+  lv_obj_set_size(dialog, 290, 115);
+  lv_obj_align(dialog, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_set_style_bg_color(dialog, COLOR_CARD, 0);
+  lv_obj_set_style_border_color(dialog, COLOR_RED_ACC, 0);
+  lv_obj_set_style_border_width(dialog, 1, 0);
+  lv_obj_set_style_radius(dialog, 8, 0);
+  lv_obj_set_style_pad_all(dialog, 6, 0);
+
+  lv_obj_t *lbl_title = lv_label_create(dialog);
+  lv_label_set_text(lbl_title, "Ajustes de Wi-Fi");
+  lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_title, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 2);
+
+  ta_ssid = lv_textarea_create(dialog);
+  lv_obj_set_size(ta_ssid, 135, 32);
+  lv_obj_align(ta_ssid, LV_ALIGN_TOP_LEFT, 2, 24);
+  lv_textarea_set_one_line(ta_ssid, true);
+  lv_textarea_set_text(ta_ssid, wifi_ssid_str.c_str());
+  lv_textarea_set_placeholder_text(ta_ssid, "SSID");
+  lv_obj_set_style_bg_color(ta_ssid, COLOR_BG, 0);
+  lv_obj_set_style_border_color(ta_ssid, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_text_color(ta_ssid, lv_color_make(255, 255, 255), 0);
+  lv_obj_add_event_cb(ta_ssid, ta_event_cb, LV_EVENT_ALL, NULL);
+
+  ta_pass = lv_textarea_create(dialog);
+  lv_obj_set_size(ta_pass, 135, 32);
+  lv_obj_align(ta_pass, LV_ALIGN_TOP_RIGHT, -2, 24);
+  lv_textarea_set_one_line(ta_pass, true);
+  lv_textarea_set_text(ta_pass, wifi_pass_str.c_str());
+  lv_textarea_set_placeholder_text(ta_pass, "Password");
+  lv_obj_set_style_bg_color(ta_pass, COLOR_BG, 0);
+  lv_obj_set_style_border_color(ta_pass, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_text_color(ta_pass, lv_color_make(255, 255, 255), 0);
+  lv_obj_add_event_cb(ta_pass, ta_event_cb, LV_EVENT_ALL, NULL);
+
+  lv_obj_t *btn_cancel = lv_btn_create(dialog);
+  lv_obj_set_size(btn_cancel, 130, 32);
+  lv_obj_align(btn_cancel, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+  lv_obj_set_style_bg_color(btn_cancel, COLOR_RED_DARK, 0);
+  lv_obj_set_style_radius(btn_cancel, 6, 0);
+  lv_obj_add_event_cb(btn_cancel, wifi_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *lbl_cancel = lv_label_create(btn_cancel);
+  lv_label_set_text(lbl_cancel, "Cancelar");
+  lv_obj_set_style_text_font(lbl_cancel, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_cancel, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *btn_save = lv_btn_create(dialog);
+  lv_obj_set_size(btn_save, 130, 32);
+  lv_obj_align(btn_save, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+  lv_obj_set_style_bg_color(btn_save, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_save, 6, 0);
+  lv_obj_add_event_cb(btn_save, wifi_save_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *lbl_save = lv_label_create(btn_save);
+  lv_label_set_text(lbl_save, "Guardar");
+  lv_obj_set_style_text_font(lbl_save, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_save, LV_ALIGN_CENTER, 0, 0);
+}
+
+// Create Printer setup popup
+void create_printer_setup_popup() {
+  if (printer_setup_overlay != NULL) return;
+
+  printer_setup_overlay = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(printer_setup_overlay, 320, 240);
+  lv_obj_set_style_bg_color(printer_setup_overlay, lv_color_make(0, 0, 0), 0);
+  lv_obj_set_style_bg_opa(printer_setup_overlay, LV_OPA_70, 0);
+  lv_obj_set_style_border_width(printer_setup_overlay, 0, 0);
+  lv_obj_set_style_radius(printer_setup_overlay, 0, 0);
+  lv_obj_align(printer_setup_overlay, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *dialog = lv_obj_create(printer_setup_overlay);
+  lv_obj_set_size(dialog, 290, 115);
+  lv_obj_align(dialog, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_set_style_bg_color(dialog, COLOR_CARD, 0);
+  lv_obj_set_style_border_color(dialog, COLOR_RED_ACC, 0);
+  lv_obj_set_style_border_width(dialog, 1, 0);
+  lv_obj_set_style_radius(dialog, 8, 0);
+  lv_obj_set_style_pad_all(dialog, 6, 0);
+
+  lv_obj_t *lbl_title = lv_label_create(dialog);
+  lv_label_set_text(lbl_title, "Ajustes de Impresora (Moonraker)");
+  lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_title, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 2);
+
+  ta_ip = lv_textarea_create(dialog);
+  lv_obj_set_size(ta_ip, 270, 32);
+  lv_obj_align(ta_ip, LV_ALIGN_TOP_MID, 0, 24);
+  lv_textarea_set_one_line(ta_ip, true);
+  lv_textarea_set_text(ta_ip, moonraker_host_str.c_str());
+  lv_textarea_set_placeholder_text(ta_ip, "IP o Host (ej. 192.168.1.100)");
+  lv_obj_set_style_bg_color(ta_ip, COLOR_BG, 0);
+  lv_obj_set_style_border_color(ta_ip, COLOR_SIDEBAR, 0);
+  lv_obj_set_style_text_color(ta_ip, lv_color_make(255, 255, 255), 0);
+  lv_obj_add_event_cb(ta_ip, ta_event_cb, LV_EVENT_ALL, NULL);
+
+  lv_obj_t *btn_cancel = lv_btn_create(dialog);
+  lv_obj_set_size(btn_cancel, 130, 32);
+  lv_obj_align(btn_cancel, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+  lv_obj_set_style_bg_color(btn_cancel, COLOR_RED_DARK, 0);
+  lv_obj_set_style_radius(btn_cancel, 6, 0);
+  lv_obj_add_event_cb(btn_cancel, printer_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *lbl_cancel = lv_label_create(btn_cancel);
+  lv_label_set_text(lbl_cancel, "Cancelar");
+  lv_obj_set_style_text_font(lbl_cancel, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_cancel, LV_ALIGN_CENTER, 0, 0);
+
+  lv_obj_t *btn_save = lv_btn_create(dialog);
+  lv_obj_set_size(btn_save, 130, 32);
+  lv_obj_align(btn_save, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+  lv_obj_set_style_bg_color(btn_save, COLOR_RED_ACC, 0);
+  lv_obj_set_style_radius(btn_save, 6, 0);
+  lv_obj_add_event_cb(btn_save, printer_save_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *lbl_save = lv_label_create(btn_save);
+  lv_label_set_text(lbl_save, "Guardar");
+  lv_obj_set_style_text_font(lbl_save, &lv_font_montserrat_14, 0);
+  lv_obj_align(lbl_save, LV_ALIGN_CENTER, 0, 0);
 }
 
 void create_config_screen(lv_obj_t *parent) {
@@ -1328,16 +1878,19 @@ void create_config_screen(lv_obj_t *parent) {
   lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(title, lv_color_make(255, 255, 255), 0);
 
-  // Tarjeta de Estados de Conexión
-  lv_obj_t *c_status = lv_obj_create(parent);
-  lv_obj_set_size(c_status, 215, 60);
-  lv_obj_set_style_bg_color(c_status, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(c_status, 0, 0);
-  lv_obj_set_style_radius(c_status, 6, 0);
-  lv_obj_set_style_pad_all(c_status, 6, 0);
+  // --- TARJETAS DE CONEXIÓN SEPARADAS Y CLICKABLES ---
 
-  lbl_wifi_state = lv_label_create(c_status);
-  lv_obj_align(lbl_wifi_state, LV_ALIGN_TOP_LEFT, 2, 2);
+  // Tarjeta Wi-Fi Clickable
+  lv_obj_t *btn_wifi_card = lv_btn_create(parent);
+  lv_obj_set_size(btn_wifi_card, 215, 38);
+  lv_obj_set_style_bg_color(btn_wifi_card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(btn_wifi_card, 0, 0);
+  lv_obj_set_style_radius(btn_wifi_card, 6, 0);
+  lv_obj_set_style_pad_all(btn_wifi_card, 6, 0);
+  lv_obj_add_event_cb(btn_wifi_card, wifi_card_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+  lbl_wifi_state = lv_label_create(btn_wifi_card);
+  lv_obj_align(lbl_wifi_state, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_text_font(lbl_wifi_state, &lv_font_montserrat_14, 0);
   
   if (WiFi.status() == WL_CONNECTED) {
@@ -1348,8 +1901,17 @@ void create_config_screen(lv_obj_t *parent) {
     lv_obj_set_style_text_color(lbl_wifi_state, COLOR_RED_ACC, 0);
   }
 
-  lbl_printer_state = lv_label_create(c_status);
-  lv_obj_align(lbl_printer_state, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+  // Tarjeta Impresora Clickable
+  lv_obj_t *btn_printer_card = lv_btn_create(parent);
+  lv_obj_set_size(btn_printer_card, 215, 38);
+  lv_obj_set_style_bg_color(btn_printer_card, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(btn_printer_card, 0, 0);
+  lv_obj_set_style_radius(btn_printer_card, 6, 0);
+  lv_obj_set_style_pad_all(btn_printer_card, 6, 0);
+  lv_obj_add_event_cb(btn_printer_card, printer_card_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+  lbl_printer_state = lv_label_create(btn_printer_card);
+  lv_obj_align(lbl_printer_state, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_text_font(lbl_printer_state, &lv_font_montserrat_14, 0);
   
   if (ws_connected) {
@@ -1360,78 +1922,13 @@ void create_config_screen(lv_obj_t *parent) {
     lv_obj_set_style_text_color(lbl_printer_state, COLOR_RED_ACC, 0);
   }
 
-  // --- Campos de texto ---
-  
-  // SSID Label
-  lv_obj_t *lbl_ssid = lv_label_create(parent);
-  lv_label_set_text(lbl_ssid, "SSID de Wi-Fi:");
-  lv_obj_set_style_text_font(lbl_ssid, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_ssid, COLOR_GREY_TEXT, 0);
-
-  // SSID TextArea
-  ta_ssid = lv_textarea_create(parent);
-  lv_obj_set_width(ta_ssid, 215);
-  lv_textarea_set_one_line(ta_ssid, true);
-  lv_textarea_set_text(ta_ssid, wifi_ssid_str.c_str());
-  lv_obj_set_style_bg_color(ta_ssid, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(ta_ssid, 1, 0);
-  lv_obj_set_style_border_color(ta_ssid, COLOR_SIDEBAR, 0);
-  lv_obj_set_style_text_color(ta_ssid, lv_color_make(255, 255, 255), 0);
-  lv_obj_add_event_cb(ta_ssid, ta_event_cb, LV_EVENT_ALL, NULL);
-
-  // Password Label
-  lv_obj_t *lbl_pass = lv_label_create(parent);
-  lv_label_set_text(lbl_pass, "Contraseña:");
-  lv_obj_set_style_text_font(lbl_pass, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_pass, COLOR_GREY_TEXT, 0);
-
-  // Password TextArea
-  ta_pass = lv_textarea_create(parent);
-  lv_obj_set_width(ta_pass, 215);
-  lv_textarea_set_one_line(ta_pass, true);
-  lv_textarea_set_text(ta_pass, wifi_pass_str.c_str());
-  lv_obj_set_style_bg_color(ta_pass, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(ta_pass, 1, 0);
-  lv_obj_set_style_border_color(ta_pass, COLOR_SIDEBAR, 0);
-  lv_obj_set_style_text_color(ta_pass, lv_color_make(255, 255, 255), 0);
-  lv_obj_add_event_cb(ta_pass, ta_event_cb, LV_EVENT_ALL, NULL);
-
-  // IP Label
-  lv_obj_t *lbl_ip = lv_label_create(parent);
-  lv_label_set_text(lbl_ip, "IP Servidor Moonraker:");
-  lv_obj_set_style_text_font(lbl_ip, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl_ip, COLOR_GREY_TEXT, 0);
-
-  // IP TextArea
-  ta_ip = lv_textarea_create(parent);
-  lv_obj_set_width(ta_ip, 215);
-  lv_textarea_set_one_line(ta_ip, true);
-  lv_textarea_set_text(ta_ip, moonraker_host_str.c_str());
-  lv_obj_set_style_bg_color(ta_ip, COLOR_CARD, 0);
-  lv_obj_set_style_border_width(ta_ip, 1, 0);
-  lv_obj_set_style_border_color(ta_ip, COLOR_SIDEBAR, 0);
-  lv_obj_set_style_text_color(ta_ip, lv_color_make(255, 255, 255), 0);
-  lv_obj_add_event_cb(ta_ip, ta_event_cb, LV_EVENT_ALL, NULL);
-
-  // Botón Conectar y Guardar
-  lv_obj_t *btn_save = lv_btn_create(parent);
-  lv_obj_set_size(btn_save, 215, 38);
-  lv_obj_set_style_bg_color(btn_save, COLOR_RED_ACC, 0);
-  lv_obj_set_style_radius(btn_save, 6, 0);
-  lv_obj_add_event_cb(btn_save, connect_save_btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t *lbl_save = lv_label_create(btn_save);
-  lv_label_set_text(lbl_save, "Conectar y Guardar");
-  lv_obj_set_style_text_font(lbl_save, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_save, LV_ALIGN_CENTER, 0, 0);
-
   // Separador decorativo
   lv_obj_t *sep = lv_obj_create(parent);
   lv_obj_set_size(sep, 215, 1);
   lv_obj_set_style_bg_color(sep, COLOR_CARD, 0);
   lv_obj_set_style_border_width(sep, 0, 0);
 
-  // Tarjeta Brillo (original)
+  // Tarjeta Brillo (con límite mínimo de 5%)
   lv_obj_t *c_bright = lv_obj_create(parent);
   lv_obj_set_size(c_bright, 215, 72);
   lv_obj_set_style_bg_color(c_bright, COLOR_CARD, 0);
@@ -1448,10 +1945,39 @@ void create_config_screen(lv_obj_t *parent) {
   lv_obj_t *slider = lv_slider_create(c_bright);
   lv_obj_set_size(slider, 195, 12);
   lv_obj_align(slider, LV_ALIGN_BOTTOM_MID, 0, -5);
+  lv_slider_set_range(slider, 5, 100); // Límite mínimo de 5%
   lv_slider_set_value(slider, screen_brightness, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(slider, COLOR_RED_ACC, LV_PART_INDICATOR);
   lv_obj_set_style_bg_color(slider, lv_color_make(255, 255, 255), LV_PART_KNOB);
   lv_obj_add_event_cb(slider, bright_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // Tarjeta Timeout (Apagado Automático)
+  lv_obj_t *c_timeout = lv_obj_create(parent);
+  lv_obj_set_size(c_timeout, 215, 66);
+  lv_obj_set_style_bg_color(c_timeout, COLOR_CARD, 0);
+  lv_obj_set_style_border_width(c_timeout, 0, 0);
+  lv_obj_set_style_radius(c_timeout, 6, 0);
+  lv_obj_set_style_pad_all(c_timeout, 6, 0);
+
+  lv_obj_t *lbl_timeout = lv_label_create(c_timeout);
+  lv_label_set_text(lbl_timeout, "Apagado Pantalla:");
+  lv_obj_set_style_text_font(lbl_timeout, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl_timeout, lv_color_make(255, 255, 255), 0);
+  lv_obj_align(lbl_timeout, LV_ALIGN_TOP_LEFT, 2, 2);
+
+  lv_obj_t *dd_timeout = lv_dropdown_create(c_timeout);
+  lv_obj_set_size(dd_timeout, 195, 30);
+  lv_obj_align(dd_timeout, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_dropdown_set_options(dd_timeout, "Nunca\n1 Minuto\n5 Minutos");
+  
+  if (screen_timeout_minutes == 0) {
+    lv_dropdown_set_selected(dd_timeout, 0);
+  } else if (screen_timeout_minutes == 1) {
+    lv_dropdown_set_selected(dd_timeout, 1);
+  } else if (screen_timeout_minutes == 5) {
+    lv_dropdown_set_selected(dd_timeout, 2);
+  }
+  lv_obj_add_event_cb(dd_timeout, timeout_dd_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
 
 }
@@ -1562,19 +2088,11 @@ void create_cyd_klipper_ui() {
   lv_obj_set_style_radius(btn_move, 6, 0);
   lv_obj_add_event_cb(btn_move, nav_event_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_t *l_move = lv_label_create(btn_move);
-  lv_label_set_text(l_move, "Mover");
+  lv_label_set_text(l_move, "Ajus");
   lv_obj_set_style_text_font(l_move, &lv_font_montserrat_14, 0);
   lv_obj_align(l_move, LV_ALIGN_CENTER, 0, 0);
 
-  // Botón Tab 3: Temperaturas
-  btn_temp = lv_btn_create(sidebar);
-  lv_obj_set_size(btn_temp, btn_w, btn_h);
-  lv_obj_set_style_radius(btn_temp, 6, 0);
-  lv_obj_add_event_cb(btn_temp, nav_event_cb, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *l_temp = lv_label_create(btn_temp);
-  lv_label_set_text(l_temp, "Temps");
-  lv_obj_set_style_text_font(l_temp, &lv_font_montserrat_14, 0);
-  lv_obj_align(l_temp, LV_ALIGN_CENTER, 0, 0);
+
 
   // Botón Tab 4: Configuración de Pantalla
   btn_config = lv_btn_create(sidebar);
@@ -1619,6 +2137,8 @@ void setup() {
   Serial.println("=============================================");
   Serial.println("CYD-Klipper Cybertech Red Edition on ESP32-S3");
   Serial.println("=============================================");
+
+  last_touch_time = millis();
 
   // 1. Inicializar retroiluminación con valor por defecto
   pinMode(TFT_BL, OUTPUT);
@@ -1672,6 +2192,15 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+
+  // Control de protector de pantalla (Timeout de inactividad)
+  if (screen_timeout_minutes > 0 && !screen_is_off) {
+    if (millis() - last_touch_time >= ((unsigned long)screen_timeout_minutes * 60000UL)) {
+      screen_is_off = true;
+      analogWrite(TFT_BL, 0); // Apagar retroiluminación física de la pantalla
+      Serial.println("[System] Pantalla apagada por inactividad prolongada.");
+    }
+  }
   
   // Procesar solicitud de reconexión manual desde la UI
   if (reconnect_requested) {

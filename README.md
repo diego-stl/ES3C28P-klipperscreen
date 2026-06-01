@@ -84,4 +84,22 @@ La pantalla está basada en el microcontrolador **ESP32-S3** con un panel LCD IP
     $$\text{Duración Estimada Total} = \frac{\text{print\_duration} \times 100}{\text{Progreso Impresión}}$$
     Mostrando la telemetría en formato `T: HH:MM:SS` (Tiempo Transcurrido) y `E: HH:MM:SS` (Tiempo Estimado Total) en tiempo real sin congelarse en ceros.
 
+### Fase 9: Fusión de Pestañas (Ajus), Coordenadas Reales y D-pad Carmesí
+* **Objetivo:** Fusionar movimiento y temperaturas en una sola pestaña scrollable, mejorar los botones direccionales e incorporar lectura física de coordenadas.
+* **Hito de Ingeniería:**
+  * **Fusión de Pantallas:** Unificamos los controles de Movimiento y Temperatura en una sola pestaña deslizante llamada `"Ajus"`, optimizando el menú de la barra lateral vertical a 4 pestañas limpias.
+  * **Coordenadas en Tiempo Real:** Agregamos `gcode_move` al sondeo no bloqueante a Moonraker para extraer la posición física (`pos_x`, `pos_y`, `pos_z`) de la boquilla en tiempo real cada 1.5 segundos. Resolvimos fallas de formato tipográfico del compilador implementando concatenación explícita mediante `String` con precisión decimal controlada.
+  * **Botonera Direccional Redesigned:** Diseñamos botones direccionales carmesí (`COLOR_RED_ACC`) a escala `35x35` px basados en el layout de `botones.png`.
+  * **Controles Unificados de Homing:** Añadimos una hilera horizontal inferior con botones para `Home TODOS` y `Motores Off` (`M84`), y expandimos la matriz de selección de pasos a 6 valores: `0.1`, `1`, `10`, `25`, `50`, `100` mm.
+
+### Fase 10: Pestaña Configuración Rediseñada, Modales Superiores y Protector de Pantalla por Inactividad
+* **Objetivo:** Reestructurar la pestaña de configuración para albergar inputs de red dinámicos en ventanas emergentes seguras, acotar los límites de brillo para evitar apagados por error e implementar un protector de pantalla automático.
+* **Hito de Ingeniería:**
+  * **Tarjetas de Conexión Pulsables:** Dividimos el bloque fijo de estado original en dos elegantes botones independientes para **Wi-Fi** e **Impresora**.
+  * **Modales Superiores Anti-Solapamiento:** Al pulsar cualquiera de las tarjetas de conexión, se despliega una superposición modal con un cuadro de diálogo centrado en la mitad superior de la pantalla (`Y = 5`). De esta forma, al enfocar los inputs táctiles, el teclado virtual de LVGL se despliega en la mitad inferior sin obstruir la vista de los datos que el usuario está escribiendo.
+  * **Límite de Brillo Activo:** Restringimos por software y hardware el rango del slider de control de brillo analógico PWM (GPIO 45) entre **5%** y **100%**, impidiendo la desactivación total accidental del display.
+  * **Protector de Pantalla (Screen Sleep/Wake):** Implementamos un selector dropdown en configuración con opciones de temporizador de inactividad (`Nunca`, `1 min`, `5 min` por defecto). Si no se detecta actividad táctil capacitiva durante dicho período, el microcontrolador suspende el PWM al **0%** apantallando a negro el display para ahorrar energía y proteger el panel.
+  * **Intercepción Táctil Inteligente:** Al tocar el panel apagado, este se reactiva instantáneamente a su brillo anterior e **ignora/consume el primer toque**, previniendo de forma segura clics involuntarios sobre la interfaz subyacente.
+
+
 
